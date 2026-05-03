@@ -9,6 +9,10 @@ Usage:
     python bench_layers.py --hidden 1024 --heads 16 --batch 64 --seq 1024
 """
 
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import argparse
 import time
 
@@ -24,21 +28,12 @@ from model.loss import cross_entropy_loss
 from efficient_model import attention as eff_attn, norm as eff_norm, swiglu as eff_swiglu
 from efficient_model.loss import CrossEntropyLoss as FusedCrossEntropyLoss
 from calculators import (
-    ModelConfig,
-    TrainingConfig,
-    GPUSpec,
-    BaselineCalculator,
-    EfficientCalculator,
-    RTX_3090,
+    ModelConfig, TrainingConfig, GPUSpec,
+    BaselineCalculator, EfficientCalculator, RTX_3090,
 )
 
 DEVICE = torch.device("cuda")
 DTYPE = torch.bfloat16
-
-
-# ---------------------------------------------------------------------------
-# Measurement helpers
-# ---------------------------------------------------------------------------
 
 
 def bench_time_ms(fn, warmup=3, iters=10):
@@ -72,25 +67,15 @@ def measure_saved_bytes(fn, exclude_tensors=None):
     return total
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-
 def make_configs(args):
     config = TransformerConfig(
-        hidden_dim=args.hidden,
-        num_heads=args.heads,
-        max_seq_len=args.seq * 2,
-        dropout=0.0,
+        hidden_dim=args.hidden, num_heads=args.heads,
+        max_seq_len=args.seq * 2, dropout=0.0,
     )
     mc = ModelConfig(
-        vocab_size=config.vocab_size,
-        hidden_dim=config.hidden_dim,
-        num_heads=config.num_heads,
-        num_layers=config.num_layers,
-        intermediate_dim=config.intermediate_dim,
-        max_seq_len=config.max_seq_len,
+        vocab_size=config.vocab_size, hidden_dim=config.hidden_dim,
+        num_heads=config.num_heads, num_layers=config.num_layers,
+        intermediate_dim=config.intermediate_dim, max_seq_len=config.max_seq_len,
     )
     tc = TrainingConfig(batch_size=args.batch, seq_len=args.seq, num_gpus=1)
     return config, mc, tc
@@ -99,33 +84,20 @@ def make_configs(args):
 def bench_layers(config, mc, tc, gpu):
     """Run all per-component benchmarks and print results."""
 
-    # (name, baseline_module, efficient_module,
-    #  calc_time_method, calc_saved_method, calc_breakdown_method)
+    # (name, baseline_module, efficient_module, saved_method, breakdown_method)
     components = [
-        (
-            "Attention",
-            base_attn.MultiHeadAttention(config),
-            eff_attn.MultiHeadAttention(config),
-            "time_attention_ms",
-            "_attn_saved_bytes",
-            "_attn_breakdown",
-        ),
-        (
-            "RMSNorm",
-            base_norm.RMSNorm(config.hidden_dim),
-            eff_norm.RMSNorm(config.hidden_dim),
-            "time_rms_norm_ms",
-            "_norm_saved_bytes",
-            "_norm_breakdown",
-        ),
-        (
-            "SwiGLU",
-            base_swiglu.SwiGLUFeedForward(config.hidden_dim, config.intermediate_dim),
-            eff_swiglu.SwiGLUFeedForward(config.hidden_dim, config.intermediate_dim),
-            "time_mlp_ms",
-            "_mlp_saved_bytes",
-            "_mlp_breakdown",
-        ),
+        ("Attention",
+         base_attn.MultiHeadAttention(config),
+         eff_attn.MultiHeadAttention(config),
+         "_attn_saved_bytes", "_attn_breakdown"),
+        ("RMSNorm",
+         base_norm.RMSNorm(config.hidden_dim),
+         eff_norm.RMSNorm(config.hidden_dim),
+         "_norm_saved_bytes", "_norm_breakdown"),
+        ("SwiGLU",
+         base_swiglu.SwiGLUFeedForward(config.hidden_dim, config.intermediate_dim),
+         eff_swiglu.SwiGLUFeedForward(config.hidden_dim, config.intermediate_dim),
+         "_mlp_saved_bytes", "_mlp_breakdown"),
     ]
 
     header = (
@@ -138,47 +110,41 @@ def bench_layers(config, mc, tc, gpu):
     print(header)
     print("-" * len(header))
 
-    for name, base_mod, eff_mod, time_m, saved_m, bd_m in components:
+    for name, base_mod, eff_mod, saved_m, bd_m in components:
         for label, mod, CalcCls in [
-            ("baseline", base_mod, BaselineCalculator),
-            ("efficient", eff_mod, EfficientCalculator),
+            ("baseline",  base_mod,  BaselineCalculator),
+            ("efficient", eff_mod,   EfficientCalculator),
         ]:
             mod = mod.to(device=DEVICE, dtype=DTYPE)
             x = torch.randn(
-                tc.batch_size,
-                tc.seq_len,
-                config.hidden_dim,
-                device=DEVICE,
-                dtype=DTYPE,
-                requires_grad=True,
+                tc.batch_size, tc.seq_len, config.hidden_dim,
+                device=DEVICE, dtype=DTYPE, requires_grad=True,
             )
             params = list(mod.parameters())
+            
+            def fwd_bwd():
+                mod.zero_grad(set_to_none=True)
+                if x.grad is not None:
+                    x.grad = None
+                mod(x).sum().backward()
 
-            actual_time = bench_time_ms(lambda: mod(x))
-            actual_mem = (
-                measure_saved_bytes(
-                    lambda: mod(x).sum().backward(),
-                    exclude_tensors=params,
-                )
-                / 1e6
-            )
+            actual_time = bench_time_ms(fwd_bwd)
+            actual_mem = measure_saved_bytes(fwd_bwd, exclude_tensors=params) / 1e6
 
             with FlopCounterMode(display=False) as fc:
-                mod(x)
+                mod(x).sum().backward()
             torch_gf = fc.get_total_flops() / 1e9
 
             calc = CalcCls(mc, tc, gpu)
-            # time_attention_ms -> roofline_time_ms(*_attn_breakdown())
-            # but we call the named method for consistency
-            pred_time = getattr(calc, time_m)()
+            bd = getattr(calc, bd_m)()
+            pred_time = calc.roofline_time_ms(bd.flops, bd.mem_bytes) * 3  # fwd + bwd ~ 3x fwd
             pred_mem = getattr(calc, saved_m)() / 1e6
-            pred_flops = getattr(calc, bd_m)().flops
-            throughput = pred_flops / (actual_time / 1000) / 1e12 if actual_time > 0 else 0
+            throughput = torch_gf * 1e9 / (actual_time / 1000) / 1e12 if actual_time > 0 else 0
 
             print(
                 f"{name:<12} {label:<12} {actual_time:>10.2f} {pred_time:>10.2f} "
                 f"{actual_mem:>10.1f} {pred_mem:>10.1f} "
-                f"{torch_gf:>10.2f} {pred_flops / 1e9:>10.2f} {throughput:>10.2f}"
+                f"{torch_gf:>10.2f} {bd.flops * 3 / 1e9:>10.2f} {throughput:>10.2f}"
             )
         print("-" * len(header))
 
@@ -215,17 +181,17 @@ def bench_lm_head_loss(config, mc, tc, gpu):
         return cross_entropy_loss(logits, labels)
 
     def baseline_fwd_bwd():
+        if lm_weight.grad is not None:
+            lm_weight.grad = None
         h = torch.randn(B, S, H, device=DEVICE, dtype=DTYPE, requires_grad=True)
         loss = baseline_fwd(h)
         loss.backward()
 
-    h_base = torch.randn(B, S, H, device=DEVICE, dtype=DTYPE, requires_grad=True)
-
-    base_time = bench_time_ms(lambda: baseline_fwd(h_base))
+    base_time = bench_time_ms(baseline_fwd_bwd)
     base_mem = measure_saved_bytes(baseline_fwd_bwd, exclude_tensors=[lm_weight]) / 1e6
 
     with FlopCounterMode(display=False) as fc:
-        baseline_fwd(h_base)
+        baseline_fwd_bwd()
     base_torch_gf = fc.get_total_flops() / 1e9
 
     base_calc = BaselineCalculator(mc, tc, gpu)
@@ -233,14 +199,13 @@ def bench_lm_head_loss(config, mc, tc, gpu):
     base_loss_bd = base_calc._loss_breakdown()
     base_pred_flops = base_bd.flops + base_loss_bd.flops
     base_pred_time = base_calc.roofline_time_ms(
-        base_pred_flops,
-        base_bd.mem_bytes + base_loss_bd.mem_bytes,
-    )
-    base_pred_mem = (base_calc._non_layer_saved_bytes()) / 1e6  # logits + softmax dominate
-    base_tp = base_pred_flops / (base_time / 1000) / 1e12 if base_time > 0 else 0
+        base_pred_flops, base_bd.mem_bytes + base_loss_bd.mem_bytes,
+    ) * 3  # fwd + bwd ~ 3x fwd
+    base_pred_mem = (base_calc._non_layer_saved_bytes()) / 1e6
+    base_tp = base_torch_gf * 1e9 / (base_time / 1000) / 1e12 if base_time > 0 else 0
 
     print(
-        f"{'LMHead+Loss':<12} {'baseline':<12} {base_time:>10.2f} {base_pred_time:>10.2f} "
+        f"{'LMHead+CE BWD':<12} {'baseline':<12} {base_time:>10.2f} {base_pred_time:>10.2f} "
         f"{base_mem:>10.1f} {base_pred_mem:>10.1f} "
         f"{base_torch_gf:>10.2f} {base_pred_flops / 1e9:>10.2f} {base_tp:>10.2f}"
     )
@@ -252,17 +217,17 @@ def bench_lm_head_loss(config, mc, tc, gpu):
         return fused_ce(hidden, lm_weight, labels)
 
     def efficient_fwd_bwd():
+        if lm_weight.grad is not None:
+            lm_weight.grad = None
         h = torch.randn(B, S, H, device=DEVICE, dtype=DTYPE, requires_grad=True)
         loss = efficient_fwd(h)
         loss.backward()
 
-    h_eff = torch.randn(B, S, H, device=DEVICE, dtype=DTYPE, requires_grad=True)
-
-    eff_time = bench_time_ms(lambda: efficient_fwd(h_eff))
+    eff_time = bench_time_ms(efficient_fwd_bwd)
     eff_mem = measure_saved_bytes(efficient_fwd_bwd, exclude_tensors=[lm_weight]) / 1e6
 
     with FlopCounterMode(display=False) as fc:
-        efficient_fwd(h_eff)
+        efficient_fwd_bwd()
     eff_torch_gf = fc.get_total_flops() / 1e9
 
     eff_calc = EfficientCalculator(mc, tc, gpu)
@@ -270,14 +235,13 @@ def bench_lm_head_loss(config, mc, tc, gpu):
     eff_loss_bd = eff_calc._loss_breakdown()
     eff_pred_flops = eff_bd.flops + eff_loss_bd.flops
     eff_pred_time = eff_calc.roofline_time_ms(
-        eff_pred_flops,
-        eff_bd.mem_bytes + eff_loss_bd.mem_bytes,
-    )
+        eff_pred_flops, eff_bd.mem_bytes + eff_loss_bd.mem_bytes,
+    ) * 3
     eff_pred_mem = (eff_calc._non_layer_saved_bytes()) / 1e6
-    eff_tp = eff_pred_flops / (eff_time / 1000) / 1e12 if eff_time > 0 else 0
+    eff_tp = eff_torch_gf * 1e9 / (eff_time / 1000) / 1e12 if eff_time > 0 else 0
 
     print(
-        f"{'LMHead+Loss':<12} {'efficient':<12} {eff_time:>10.2f} {eff_pred_time:>10.2f} "
+        f"{'LMHead+CE BWD':<12} {'efficient':<12} {eff_time:>10.2f} {eff_pred_time:>10.2f} "
         f"{eff_mem:>10.1f} {eff_pred_mem:>10.1f} "
         f"{eff_torch_gf:>10.2f} {eff_pred_flops / 1e9:>10.2f} {eff_tp:>10.2f}"
     )
@@ -288,17 +252,27 @@ def main():
     parser = argparse.ArgumentParser(description="Per-component benchmark")
     parser.add_argument("--hidden", type=int, default=512)
     parser.add_argument("--heads", type=int, default=8)
-    parser.add_argument("--batch", type=int, default=512)
+    parser.add_argument("--batch", type=int, default=1024)
+    parser.add_argument("--batch-ce", type=int, default=128,
+                        help="Batch size for LM head + loss (smaller to avoid OOM from B*S*V logits)")
     parser.add_argument("--seq", type=int, default=512)
     args = parser.parse_args()
 
     config, mc, tc = make_configs(args)
 
     # Override GPU spec here for your hardware.
-    gpu = GPUSpec(name="RTX 3090", memory_bandwidth_gbps=936, flops_bf16_tflops=50, interconnect_bandwidth_gbps=32)
+    gpu = GPUSpec(name="RTX 3090", memory_bandwidth_gbps=842,
+                  flops_bf16_tflops=66, interconnect_bandwidth_gbps=32)
 
     bench_layers(config, mc, tc, gpu)
-    bench_lm_head_loss(config, mc, tc, gpu)
+
+    # Smaller batch for LM head + loss to avoid OOM (B*S*V logits tensor)
+    args_ce = argparse.Namespace(
+        hidden=args.hidden, heads=args.heads,
+        batch=args.batch_ce, seq=args.seq,
+    )
+    config_ce, mc_ce, tc_ce = make_configs(args_ce)
+    bench_lm_head_loss(config_ce, mc_ce, tc_ce, gpu)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 torch>=2.4
 triton>=3.0
-flash-attn>=2.8
+# flash-attn>=2.8 suggest to load pre-build wheels like https://github.com/Dao-AILab/flash-attention/releases
 liger-kernel
 pytest

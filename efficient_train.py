@@ -23,7 +23,7 @@ from efficient_model import EfficientTransformer, TransformerBlock
 from efficient_optimizer.ademamix import AdEMAMix
 
 
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, MixedPrecision
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
 
@@ -103,25 +103,13 @@ def train(args):
     model = EfficientTransformer(config).to(device)  # dtype?
 
     if world_size > 1:
-        # todo:
-        # wrap each TransformerBlock as a separate FSDP unit so params are sharded per-layer, not as one flat blob
-        import functools
-        from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+        from torch.distributed.fsdp import fully_shard
+        for layer in model.layers:
+            fully_shard(layer)
+        fully_shard(model)
+    autocast_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if args.use_amp else nullcontext()
 
-        policy = functools.partial(transformer_auto_wrap_policy, transformer_layer_cls={TransformerBlock})
-
-        mp = MixedPrecision(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.float32,
-            buffer_dtype=torch.bfloat16,
-        )
-        # DDP works with device_ids, FSDP only with device_id
-        model = FSDP(model, mixed_precision=mp, auto_wrap_policy=policy, device_id=local_rank)
-        autocast_ctx = nullcontext()
-    else:
-        autocast_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16)
-
-    raw_model = model.module if world_size > 1 else model
+    raw_model = model # model.module if world_size > 1 else model FSDP doesn't wrap model
     num_params = sum(p.numel() for p in model.parameters())
     if is_master:
         print(f"Model parameters: {num_params:,}")
@@ -245,7 +233,7 @@ def main():
     parser.add_argument("--use-amp", action="store_true", help="Use automatic mixed precision")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--num-workers", type=int, default=4, help="DataLoader workers")
-    parser.add_argument("--log-interval", type=int, default=10, help="Log every N steps")
+    parser.add_argument("--log-interval", type=int, default=1, help="Log every N steps")
 
     args = parser.parse_args()
     train(args)

@@ -154,3 +154,32 @@ torchrun --nproc_per_node=2 efficient_train.py --batch-size 16 --num-epochs 1
 ## Requirements
 
 PyTorch 2.11+, Triton, flash-attn 2.8+, liger-kernel. See the notebook for exact install commands.
+
+
+# Installation tips
+
+```bash
+pip install -r requirements.txt
+```
+
+## flash-attn
+
+flash-attn builds from source and needs CUDA toolkit + nvcc.
+This takes ~15 min.
+
+```bash
+# check your CUDA version first
+python -c "import torch; print(torch.version.cuda)"
+
+# install matching CUDA runtime if nvcc is missing
+pip install nvidia-cuda-runtime-cu12  # or cu11 for CUDA 11.x
+
+# then install flash-attn
+pip install flash-attn --no-build-isolation
+```
+
+If the build fails, check that your CUDA toolkit version matches
+PyTorch's. Common fix: `nvcc --version` and `torch.version.cuda`
+should show the same major version (e.g. both 12.x).
+
+Prebuilt wheels (faster): https://github.com/Dao-AILab/flash-attention/releases

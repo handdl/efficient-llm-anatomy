@@ -1,48 +1,48 @@
 """
-Per-component benchmark: Attention, RMSNorm, SwiGLU, LM Head + Loss.
+Full-model benchmark: predicted vs actual for time, memory, FLOPs.
 
-Compares baseline vs efficient implementations across time, saved-tensor
-memory, FLOPs (torch counter vs calculator prediction), and throughput.
+Runs a single (model_type, config) combination. Use bench_sweep.py to
+run across multiple configs.
+
+Supports single-GPU and distributed (DDP for baseline, FSDP for efficient).
 
 Usage:
-    python bench_layers.py
-    python bench_layers.py --hidden 1024 --heads 16 --batch 64 --seq 1024
+    python bench_model.py --type baseline  --hidden 512 --heads 8 --batch 16 --seq 512
+    python bench_model.py --type efficient --hidden 512 --heads 8 --batch 16 --seq 512
+
+    torchrun --nproc_per_node=2 bench_model.py --type baseline  --hidden 512 --heads 8 --batch 16 --seq 512
+    torchrun --nproc_per_node=2 bench_model.py --type efficient --hidden 512 --heads 8 --batch 16 --seq 512
 """
 
-import argparse
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+import gc
 import time
+import argparse
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import torch.distributed as dist
 from torch.autograd.graph import saved_tensors_hooks
 from torch.utils.flop_counter import FlopCounterMode
 
 from config import TransformerConfig
-from model import attention as base_attn, norm as base_norm, swiglu as base_swiglu
-from model.loss import cross_entropy_loss
-from efficient_model import attention as eff_attn, norm as eff_norm, swiglu as eff_swiglu
-from efficient_model.loss import CrossEntropyLoss as FusedCrossEntropyLoss
+from model.transformer import BaselineTransformer
+from efficient_model.transformer import EfficientTransformer, TransformerBlock
+from efficient_optimizer.ademamix import AdEMAMix
 from calculators import (
-    ModelConfig,
-    TrainingConfig,
-    GPUSpec,
-    BaselineCalculator,
-    EfficientCalculator,
-    RTX_3090,
+    ModelConfig, TrainingConfig, GPUSpec,
+    BaselineCalculator, EfficientCalculator,
 )
 
-DEVICE = torch.device("cuda")
 DTYPE = torch.bfloat16
 
 
-# ---------------------------------------------------------------------------
-# Measurement helpers
-# ---------------------------------------------------------------------------
-
-
-def bench_time_ms(fn, warmup=3, iters=10):
-    """Wall-clock time per call (ms), averaged over iters after warmup."""
+def bench_time_ms(fn, warmup=5, iters=20):
     for _ in range(warmup):
         fn()
         torch.cuda.synchronize()
@@ -55,13 +55,12 @@ def bench_time_ms(fn, warmup=3, iters=10):
 
 
 def measure_saved_bytes(fn, exclude_tensors=None):
-    """Total unique bytes saved for backward, excluding params/buffers."""
-    exclude_ptrs = {t.data_ptr() for t in (exclude_tensors or [])}
+    exclude_ptrs = {t.data.data_ptr() for t in (exclude_tensors or [])}
     seen, total = set(), 0
 
     def pack(t):
         nonlocal total
-        ptr = t.data_ptr()
+        ptr = t.data.data_ptr()
         if ptr not in exclude_ptrs and ptr not in seen:
             seen.add(ptr)
             total += t.numel() * t.element_size()
@@ -72,233 +71,210 @@ def measure_saved_bytes(fn, exclude_tensors=None):
     return total
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+def measure_peak_memory(fn):
+    gc.collect()
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    fn()
+    torch.cuda.synchronize()
+    return torch.cuda.max_memory_allocated()
 
 
-def make_configs(args):
-    config = TransformerConfig(
-        hidden_dim=args.hidden,
-        num_heads=args.heads,
-        max_seq_len=args.seq * 2,
-        dropout=0.0,
-    )
-    mc = ModelConfig(
-        vocab_size=config.vocab_size,
-        hidden_dim=config.hidden_dim,
-        num_heads=config.num_heads,
-        num_layers=config.num_layers,
-        intermediate_dim=config.intermediate_dim,
-        max_seq_len=config.max_seq_len,
-    )
-    tc = TrainingConfig(batch_size=args.batch, seq_len=args.seq, num_gpus=1)
-    return config, mc, tc
+def setup_distributed():
+    if "RANK" not in os.environ:
+        return 0, 1, 0
+    dist.init_process_group(backend="nccl")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+    return rank, world_size, local_rank
 
 
-def bench_layers(config, mc, tc, gpu):
-    """Run all per-component benchmarks and print results."""
-
-    # (name, baseline_module, efficient_module,
-    #  calc_time_method, calc_saved_method, calc_breakdown_method)
-    components = [
-        (
-            "Attention",
-            base_attn.MultiHeadAttention(config),
-            eff_attn.MultiHeadAttention(config),
-            "time_attention_ms",
-            "_attn_saved_bytes",
-            "_attn_breakdown",
-        ),
-        (
-            "RMSNorm",
-            base_norm.RMSNorm(config.hidden_dim),
-            eff_norm.RMSNorm(config.hidden_dim),
-            "time_rms_norm_ms",
-            "_norm_saved_bytes",
-            "_norm_breakdown",
-        ),
-        (
-            "SwiGLU",
-            base_swiglu.SwiGLUFeedForward(config.hidden_dim, config.intermediate_dim),
-            eff_swiglu.SwiGLUFeedForward(config.hidden_dim, config.intermediate_dim),
-            "time_mlp_ms",
-            "_mlp_saved_bytes",
-            "_mlp_breakdown",
-        ),
-    ]
-
-    header = (
-        f"{'Component':<12} {'Type':<12} {'Time ms':>10} {'Pred ms':>10} "
-        f"{'Mem MB':>10} {'Pred MB':>10} {'Torch GF':>10} {'Calc GF':>10} {'TFLOP/s':>10}"
-    )
-    print(f"\n{'=' * len(header)}")
-    print(f"  Per-Layer  B={tc.batch_size}  S={tc.seq_len}  H={config.hidden_dim}")
-    print(f"{'=' * len(header)}")
-    print(header)
-    print("-" * len(header))
-
-    for name, base_mod, eff_mod, time_m, saved_m, bd_m in components:
-        for label, mod, CalcCls in [
-            ("baseline", base_mod, BaselineCalculator),
-            ("efficient", eff_mod, EfficientCalculator),
-        ]:
-            mod = mod.to(device=DEVICE, dtype=DTYPE)
-            x = torch.randn(
-                tc.batch_size,
-                tc.seq_len,
-                config.hidden_dim,
-                device=DEVICE,
-                dtype=DTYPE,
-                requires_grad=True,
-            )
-            params = list(mod.parameters())
-
-            actual_time = bench_time_ms(lambda: mod(x))
-            actual_mem = (
-                measure_saved_bytes(
-                    lambda: mod(x).sum().backward(),
-                    exclude_tensors=params,
-                )
-                / 1e6
-            )
-
-            with FlopCounterMode(display=False) as fc:
-                mod(x)
-            torch_gf = fc.get_total_flops() / 1e9
-
-            calc = CalcCls(mc, tc, gpu)
-            # time_attention_ms -> roofline_time_ms(*_attn_breakdown())
-            # but we call the named method for consistency
-            pred_time = getattr(calc, time_m)()
-            pred_mem = getattr(calc, saved_m)() / 1e6
-            pred_flops = getattr(calc, bd_m)().flops
-            throughput = pred_flops / (actual_time / 1000) / 1e12 if actual_time > 0 else 0
-
-            print(
-                f"{name:<12} {label:<12} {actual_time:>10.2f} {pred_time:>10.2f} "
-                f"{actual_mem:>10.1f} {pred_mem:>10.1f} "
-                f"{torch_gf:>10.2f} {pred_flops / 1e9:>10.2f} {throughput:>10.2f}"
-            )
-        print("-" * len(header))
+def wrap_distributed(model, world_size, local_rank, model_type):
+    if world_size == 1:
+        return model
+    if model_type == "baseline":
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        return DDP(model, device_ids=[local_rank])
+    else:
+        from torch.distributed.fsdp import fully_shard
+        for layer in model.layers:
+            fully_shard(layer)
+        fully_shard(model)
+        return model
 
 
-def bench_lm_head_loss(config, mc, tc, gpu):
-    """
-    Benchmark LM Head + Loss as a combined operation.
+def calc_fwd_flops(calc):
+    """Sum per-layer + non-layer forward FLOPs from breakdown methods."""
+    f = 0
+    for _ in range(calc.N):
+        f += calc._attn_breakdown().flops
+        f += calc._mlp_breakdown().flops
+        f += 2 * calc._norm_breakdown().flops
+    f += calc._embedding_breakdown().flops
+    f += calc._lm_head_breakdown().flops
+    f += calc._loss_breakdown().flops
+    return f
 
-    Baseline: logits = hidden @ weight.T, then F.cross_entropy.
-    Efficient: Liger fused linear CE (chunked, never materializes logits).
 
-    This doesn't fit the generic component loop because the baseline is
-    two separate ops and the efficient version fuses them into one.
-    """
-    B, S, H, V = tc.batch_size, tc.seq_len, config.hidden_dim, config.vocab_size
-
-    header = (
-        f"{'Component':<12} {'Type':<12} {'Time ms':>10} {'Pred ms':>10} "
-        f"{'Mem MB':>10} {'Pred MB':>10} {'Torch GF':>10} {'Calc GF':>10} {'TFLOP/s':>10}"
-    )
-    print(f"\n{'=' * len(header)}")
-    print(f"  LM Head + Loss  B={B}  S={S}  H={H}  V={V}")
-    print(f"{'=' * len(header)}")
-    print(header)
-    print("-" * len(header))
-
-    # Shared inputs
-    lm_weight = torch.randn(V, H, device=DEVICE, dtype=DTYPE, requires_grad=True)
-    labels = torch.randint(0, V, (B, S), device=DEVICE)
-
-    # --- Baseline: separate lm_head + cross_entropy ---
-    def baseline_fwd(hidden):
-        logits = hidden @ lm_weight.T
-        return cross_entropy_loss(logits, labels)
-
-    def baseline_fwd_bwd():
-        h = torch.randn(B, S, H, device=DEVICE, dtype=DTYPE, requires_grad=True)
-        loss = baseline_fwd(h)
-        loss.backward()
-
-    h_base = torch.randn(B, S, H, device=DEVICE, dtype=DTYPE, requires_grad=True)
-
-    base_time = bench_time_ms(lambda: baseline_fwd(h_base))
-    base_mem = measure_saved_bytes(baseline_fwd_bwd, exclude_tensors=[lm_weight]) / 1e6
-
-    with FlopCounterMode(display=False) as fc:
-        baseline_fwd(h_base)
-    base_torch_gf = fc.get_total_flops() / 1e9
-
-    base_calc = BaselineCalculator(mc, tc, gpu)
-    base_bd = base_calc._lm_head_breakdown()
-    base_loss_bd = base_calc._loss_breakdown()
-    base_pred_flops = base_bd.flops + base_loss_bd.flops
-    base_pred_time = base_calc.roofline_time_ms(
-        base_pred_flops,
-        base_bd.mem_bytes + base_loss_bd.mem_bytes,
-    )
-    base_pred_mem = (base_calc._non_layer_saved_bytes()) / 1e6  # logits + softmax dominate
-    base_tp = base_pred_flops / (base_time / 1000) / 1e12 if base_time > 0 else 0
-
-    print(
-        f"{'LMHead+Loss':<12} {'baseline':<12} {base_time:>10.2f} {base_pred_time:>10.2f} "
-        f"{base_mem:>10.1f} {base_pred_mem:>10.1f} "
-        f"{base_torch_gf:>10.2f} {base_pred_flops / 1e9:>10.2f} {base_tp:>10.2f}"
-    )
-
-    # --- Efficient: fused linear cross-entropy ---
-    fused_ce = FusedCrossEntropyLoss()
-
-    def efficient_fwd(hidden):
-        return fused_ce(hidden, lm_weight, labels)
-
-    def efficient_fwd_bwd():
-        h = torch.randn(B, S, H, device=DEVICE, dtype=DTYPE, requires_grad=True)
-        loss = efficient_fwd(h)
-        loss.backward()
-
-    h_eff = torch.randn(B, S, H, device=DEVICE, dtype=DTYPE, requires_grad=True)
-
-    eff_time = bench_time_ms(lambda: efficient_fwd(h_eff))
-    eff_mem = measure_saved_bytes(efficient_fwd_bwd, exclude_tensors=[lm_weight]) / 1e6
-
-    with FlopCounterMode(display=False) as fc:
-        efficient_fwd(h_eff)
-    eff_torch_gf = fc.get_total_flops() / 1e9
-
-    eff_calc = EfficientCalculator(mc, tc, gpu)
-    eff_bd = eff_calc._lm_head_breakdown()
-    eff_loss_bd = eff_calc._loss_breakdown()
-    eff_pred_flops = eff_bd.flops + eff_loss_bd.flops
-    eff_pred_time = eff_calc.roofline_time_ms(
-        eff_pred_flops,
-        eff_bd.mem_bytes + eff_loss_bd.mem_bytes,
-    )
-    eff_pred_mem = (eff_calc._non_layer_saved_bytes()) / 1e6
-    eff_tp = eff_pred_flops / (eff_time / 1000) / 1e12 if eff_time > 0 else 0
-
-    print(
-        f"{'LMHead+Loss':<12} {'efficient':<12} {eff_time:>10.2f} {eff_pred_time:>10.2f} "
-        f"{eff_mem:>10.1f} {eff_pred_mem:>10.1f} "
-        f"{eff_torch_gf:>10.2f} {eff_pred_flops / 1e9:>10.2f} {eff_tp:>10.2f}"
-    )
-    print("-" * len(header))
+def calc_fwd_bwd_flops(calc):
+    """Forward+backward FLOPs. Loss is not recomputed, everything else x3."""
+    fwd = calc_fwd_flops(calc)
+    loss = calc._loss_breakdown().flops
+    return (fwd - loss) * 3 + loss
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Per-component benchmark")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--hidden", type=int, default=512)
     parser.add_argument("--heads", type=int, default=8)
-    parser.add_argument("--batch", type=int, default=512)
+    parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--seq", type=int, default=512)
+    parser.add_argument("--type", choices=["baseline", "efficient"], required=True)
     args = parser.parse_args()
 
-    config, mc, tc = make_configs(args)
+    rank, world_size, local_rank = setup_distributed()
+    device = torch.device(f"cuda:{local_rank}")
+    is_master = rank == 0
+    is_distributed = world_size > 1
 
-    # Override GPU spec here for your hardware. Here I use achievable flops (~50-60)
-    gpu = GPUSpec(name="RTX 3090", memory_bandwidth_gbps=936, flops_bf16_tflops=60, interconnect_bandwidth_gbps=32)
+    # Override for your hardware.
+    gpu = GPUSpec(name="RTX 3090", memory_bandwidth_gbps=842,
+                  flops_bf16_tflops=66, interconnect_bandwidth_gbps=32)
 
-    bench_layers(config, mc, tc, gpu)
-    bench_lm_head_loss(config, mc, tc, gpu)
+    config = TransformerConfig(
+        hidden_dim=args.hidden, num_heads=args.heads,
+        max_seq_len=args.seq * 2, dropout=0.0,
+    )
+    mc = ModelConfig(
+        vocab_size=config.vocab_size, hidden_dim=config.hidden_dim,
+        num_heads=config.num_heads, num_layers=config.num_layers,
+        intermediate_dim=config.intermediate_dim, max_seq_len=config.max_seq_len,
+    )
+    tc = TrainingConfig(batch_size=args.batch, seq_len=args.seq, num_gpus=world_size)
+
+    ModelClass = BaselineTransformer if args.type == "baseline" else EfficientTransformer
+    CalcClass = BaselineCalculator if args.type == "baseline" else EfficientCalculator
+
+    model = ModelClass(config).to(device=device, dtype=DTYPE)
+    model = wrap_distributed(model, world_size, local_rank, args.type)
+    raw = model.module if hasattr(model, "module") else model
+    optimizer = AdEMAMix(model.parameters(), lr=1e-4, betas=(0.9, 0.999, 0.9999))
+
+    input_ids = torch.randint(0, config.vocab_size, (args.batch, args.seq), device=device)
+    labels = input_ids.clone()
+
+    if args.type == "baseline":
+        def fwd():
+            return raw.compute_loss(raw(input_ids), labels)
+
+        def fwd_bwd():
+            raw.compute_loss(raw(input_ids), labels).backward()
+
+        def full_step():
+            optimizer.zero_grad(set_to_none=True)
+            raw.compute_loss(raw(input_ids), labels).backward()
+            optimizer.step()
+    else:
+        def fwd():
+            return raw(input_ids, labels=labels)
+
+        def fwd_bwd():
+            raw(input_ids, labels=labels).backward()
+
+        def full_step():
+            optimizer.zero_grad(set_to_none=True)
+            raw(input_ids, labels=labels).backward()
+            optimizer.step()
+
+    calc = CalcClass(mc, tc, gpu)
+
+    # FlopCounterMode inflates peak memory, so measure peak first.
+    peak = measure_peak_memory(full_step)
+    pred_peak = calc.peak_memory()
+
+    # Single-GPU: also measure saved tensors and FLOPs.
+    if not is_distributed:
+        exclude = list(model.parameters()) + list(model.buffers())
+        saved = measure_saved_bytes(fwd_bwd, exclude_tensors=exclude)
+        pred_saved = calc.activation_memory()
+
+        with FlopCounterMode(display=False) as fc:
+            fwd()
+        torch_fwd_flops = fc.get_total_flops()
+
+        with FlopCounterMode(display=False) as fc:
+            fwd_bwd()
+        torch_fwd_bwd_flops = fc.get_total_flops()
+
+        pred_fwd_flops = calc_fwd_flops(calc)
+        pred_fwd_bwd_flops = calc_fwd_bwd_flops(calc)
+
+    if is_distributed:
+        dist.barrier()
+
+    fwd_time = bench_time_ms(fwd)
+    fwd_bwd_time = bench_time_ms(fwd_bwd)
+    step_time = bench_time_ms(full_step)
+
+    if is_master:
+        mode = ("ddp" if args.type == "baseline" else "fsdp") if is_distributed else "single"
+
+        header = (
+            f"{'pass':<5} {'type':<10} {'mode':<6} "
+            f"{'ms':>7} {'pred':>7} "
+            f"{'save':>6} {'pred':>6} "
+            f"{'peak':>6} {'pred':>6} "
+            f"{'GF':>7} {'pred':>7} "
+            f"{'TF/s':>6}"
+        )
+        print(f"\nG={world_size} H={args.hidden} B={args.batch} S={args.seq}")
+        print(header)
+        print("-" * len(header))
+
+        na = "---"
+
+        if not is_distributed:
+            fwd_tfs = torch_fwd_flops / (fwd_time / 1000) / 1e12
+            bwd_tfs = torch_fwd_bwd_flops / (fwd_bwd_time / 1000) / 1e12
+
+            print(
+                f"{'fwd':<5} {args.type:<10} {mode:<6} "
+                f"{fwd_time:>7.1f} {calc.time_forward_ms():>7.1f} "
+                f"{saved / 1e6:>6.0f} {pred_saved / 1e6:>6.0f} "
+                f"{na:>6} {na:>6} "
+                f"{torch_fwd_flops / 1e9:>7.0f} {pred_fwd_flops / 1e9:>7.0f} "
+                f"{fwd_tfs:>6.1f}"
+            )
+            print(
+                f"{'fb':<5} {args.type:<10} {mode:<6} "
+                f"{fwd_bwd_time:>7.1f} {calc.time_forward_backward_ms():>7.1f} "
+                f"{na:>6} {na:>6} "
+                f"{peak / 1e6:>6.0f} {pred_peak / 1e6:>6.0f} "
+                f"{torch_fwd_bwd_flops / 1e9:>7.0f} {pred_fwd_bwd_flops / 1e9:>7.0f} "
+                f"{bwd_tfs:>6.1f}"
+            )
+            print(
+                f"{'step':<5} {args.type:<10} {mode:<6} "
+                f"{step_time:>7.1f} {na:>7} "
+                f"{na:>6} {na:>6} {na:>6} {na:>6} {na:>7} {na:>7} {na:>6}"
+            )
+        else:
+            pred_step = calc.time_total_step_ms()
+            pred_comm = calc.time_communication_ms()
+            print(
+                f"{'step':<5} {args.type:<10} {mode:<6} "
+                f"{step_time:>7.1f} {pred_step:>7.1f} "
+                f"{na:>6} {na:>6} "
+                f"{peak / 1e6:>6.0f} {pred_peak / 1e6:>6.0f} "
+                f"{na:>7} {na:>7} {na:>6}"
+            )
+            print(f"comm_pred={pred_comm:.2f} ms (theoretical lower bound)\n")
+
+    if is_distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

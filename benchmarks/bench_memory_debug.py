@@ -11,6 +11,9 @@ Usage:
     python bench_memory_debug.py --type baseline  --hidden 512 --batch 16 --seq 2048
     python bench_memory_debug.py --type efficient --hidden 1024 --batch 32 --seq 4096
 """
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import gc
 import argparse
@@ -48,7 +51,7 @@ def main():
     args = parser.parse_args()
 
     # Override for your hardware.
-    gpu = GPUSpec(name="RTX 3090", memory_bandwidth_gbps=936, flops_bf16_tflops=50, interconnect_bandwidth_gbps=32)
+    gpu = GPUSpec(name="RTX 3090", memory_bandwidth_gbps=842, flops_bf16_tflops=66, interconnect_bandwidth_gbps=32)
 
     config = TransformerConfig(
         hidden_dim=args.hidden,

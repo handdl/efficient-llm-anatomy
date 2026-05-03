@@ -6,36 +6,41 @@ Usage:
     python bench_sweep.py --gpus 2     # distributed
 """
 
+import os
 import subprocess
 import sys
 import argparse
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+BENCH_MODEL = os.path.join(SCRIPT_DIR, "bench_model.py")
+
 CONFIGS = [
     # (hidden, heads, batch, seq)
-    (512, 8, 8, 512),
-    (512, 8, 32, 512),
-    (512, 8, 8, 2048),
-    (512, 8, 32, 2048),
-    (1024, 8, 8, 4096),
-    (1024, 8, 32, 4096),
+    (512,  8,   8,  512),
+    (512,  8,  32,  512),
+    (512,  8,   8, 2048),
+    (512,  8,  32, 2048),
+    (1024, 8,   8, 4096),
+    (1024, 8,  32, 4096),
 ]
 
 
 def run(cmd):
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        print(f"FAILED: {' '.join(cmd)}")
-        if result.stderr:
-            # Print last 5 lines of stderr for debugging.
-            for line in result.stderr.strip().split("\n")[-5:]:
-                print(f"  {line}")
+        print(f"FAILED (Probably OOM): {' '.join(cmd)}")
+        # if result.stderr:
+        #     # Print last 5 lines of stderr for debugging.
+        #     for line in result.stderr.strip().split("\n")[-5:]:
+        #         print(f"  {line}")
     else:
         print(result.stdout.strip())
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--gpus", type=int, default=0, help="GPUs for distributed (0 = single-GPU only)")
+    parser.add_argument("--gpus", type=int, default=0,
+                        help="GPUs for distributed (0 = single-GPU only)")
     args = parser.parse_args()
 
     distributed = args.gpus > 1
@@ -47,24 +52,16 @@ def main():
         for model_type in ["baseline", "efficient"]:
             if distributed:
                 cmd = [
-                    "torchrun",
-                    f"--nproc_per_node={args.gpus}",
-                    "bench_model.py",
+                    "torchrun", f"--nproc_per_node={args.gpus}",
+                    BENCH_MODEL,
                 ]
             else:
-                cmd = [sys.executable, "bench_model.py"]
+                cmd = [sys.executable, BENCH_MODEL]
 
             cmd += [
-                "--hidden",
-                str(h),
-                "--heads",
-                str(nh),
-                "--batch",
-                str(b),
-                "--seq",
-                str(s),
-                "--type",
-                model_type,
+                "--hidden", str(h), "--heads", str(nh),
+                "--batch", str(b), "--seq", str(s),
+                "--type", model_type,
             ]
             run(cmd)
         print()

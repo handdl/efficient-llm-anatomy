@@ -1,0 +1,5 @@
+torch>=2.4
+triton>=3.0
+flash-attn>=2.8
+liger-kernel
+pytest

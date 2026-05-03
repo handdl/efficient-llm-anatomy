@@ -171,11 +171,9 @@ def bench_lm_head_loss(config, mc, tc, gpu):
     print(header)
     print("-" * len(header))
 
-    # Shared inputs
     lm_weight = torch.randn(V, H, device=DEVICE, dtype=DTYPE, requires_grad=True)
     labels = torch.randint(0, V, (B, S), device=DEVICE)
 
-    # --- Baseline: separate lm_head + cross_entropy ---
     def baseline_fwd(hidden):
         logits = hidden @ lm_weight.T
         return cross_entropy_loss(logits, labels)
@@ -207,10 +205,9 @@ def bench_lm_head_loss(config, mc, tc, gpu):
     print(
         f"{'LMHead+CE BWD':<12} {'baseline':<12} {base_time:>10.2f} {base_pred_time:>10.2f} "
         f"{base_mem:>10.1f} {base_pred_mem:>10.1f} "
-        f"{base_torch_gf:>10.2f} {base_pred_flops / 1e9:>10.2f} {base_tp:>10.2f}"
+        f"{base_torch_gf:>10.2f} {base_pred_flops * 3/ 1e9:>10.2f} {base_tp:>10.2f}"
     )
 
-    # --- Efficient: fused linear cross-entropy ---
     fused_ce = FusedCrossEntropyLoss()
 
     def efficient_fwd(hidden):
